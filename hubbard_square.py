@@ -1,5 +1,5 @@
 #DMFT calculation for a hubbard model on a 2D square lattice
-#uses Triqs version 2.2
+#uses Triqs version 3.0.x
 
 from triqs.sumk import *
 from triqs.gf import *
