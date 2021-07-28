@@ -14,7 +14,7 @@ beta = 40.
 t = -1.                   #nearest neighbor hopping
 tp = 0.                   #next nearest neighbor hopping
 U = 3                     # hubbard U parameter
-nloops = 10               # number of DMFT loops
+nloops = 10               # number of DMFT loops needs 5-10 loops to converge
 nk = 30                   # number of k points in each dimension
 density_required = 1.     # target density for setting the chemical potential
 
@@ -25,7 +25,7 @@ p = {}
 p["random_seed"] = 123 * mpi.rank + 567
 p["length_cycle"] = 200
 p["n_warmup_cycles"] = int(1e4)
-p["n_cycles"] = int(1e6/mpi.size)
+p["n_cycles"] = int(1e7/mpi.size)
 # tail fit
 # turn this off to get the raw QMC results without fitting
 p["perform_tail_fit"] = True
@@ -93,20 +93,36 @@ for iteration_number in range(1,nloops+1):
     # calling the k sum here which you need to manually implement or change
     # but it is all python, even the invert is done on a numpy array
     # github.com/TRIQS/triqs/blob/3.0.x/python/triqs/sumk/sumk_discrete.py#L73
+
+    # TODO step 3 write a new python function which replaces the SK() call which accepts a iw_vector and does the k sum only on these frequencies
+    # include timing! 
     Gloc << SK(mu = mu, Sigma = S.Sigma_iw)
 
+    # TODO step 1
+    # extract special Gloc(iw) points and do the DLR and back
+    # iw_freq = [1, 10, 55, ..]
+    # Gloc_spec = Gloc['up].data[iw_freq,:,:] #Gloc_spec is now a np array
+    # DLR fit
+    # evaluate DLR fit at all iw frequencies
+    # see if the result is the same
+        
     nlat = Gloc.total_density().real # lattice density
 
     # set starting guess for Sigma = U/2 at first iteration
     if it == 1:
         S.Sigma_iw << .5*U
 
+    # note with DLR it is good do replace this with the Delta(tau) interface
     S.G0_iw << inverse(S.Sigma_iw + inverse(Gloc))
     # solve the impurity problem. The solver is performing the dyson equation as postprocessing
     S.solve(h_int=h_int, **p)
 
-    # a manual dyson equation would look like this:
+    # a manual dyson equation would look like this
     # S.Sigma_iw << inverse(S.G0_iw) - inverse(S.G_iw)
+    # TODO step 2:
+    # replace this dyson eq by a fitting S.G_tau with a DLR fit and then extract Sigma
+    # on DLR frequency grid to get rid of tail-fitting
+    # write Fourier() replacement method with DLR 
 
     #force self energy obtained from solver to be hermitian
     for name, s_iw in S.Sigma_iw:
