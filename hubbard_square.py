@@ -10,6 +10,8 @@ from triqs_cthyb import *
 from h5 import HDFArchive
 from triqs.operators import *
 
+from timeit import default_timer as timer
+
 beta = 40.
 t = -1.                   #nearest neighbor hopping
 tp = 0.                   #next nearest neighbor hopping
@@ -89,14 +91,20 @@ for iteration_number in range(1,nloops+1):
         S.Sigma_iw['down'] << S.Sigma_iw['up']
 
     # determination of the next chemical potential via function Dens. Involves k summation
+    start_time = timer()
     mu, density = dichotomy(Dens, mu, density_required, 1e-4, .5, max_loops = 100, x_name="chemical potential", y_name="density", verbosity=3)
+    mpi.barrier()
+    mpi.report('\nnumber of kpoints:', SK.n_kpts())
+    mpi.report('time for calculating mu: {:.2f} s'.format(timer() - start_time))
     # calling the k sum here which you need to manually implement or change
     # but it is all python, even the invert is done on a numpy array
     # github.com/TRIQS/triqs/blob/3.0.x/python/triqs/sumk/sumk_discrete.py#L73
 
     # TODO step 3 write a new python function which replaces the SK() call which accepts a iw_vector and does the k sum only on these frequencies
-    # include timing! 
+    start_time = timer()
     Gloc << SK(mu = mu, Sigma = S.Sigma_iw)
+    mpi.barrier()
+    mpi.report('time for k sum: {:.2f} s'.format(timer() - start_time))
 
     # TODO step 1
     # extract special Gloc(iw) points and do the DLR and back
@@ -105,7 +113,7 @@ for iteration_number in range(1,nloops+1):
     # DLR fit
     # evaluate DLR fit at all iw frequencies
     # see if the result is the same
-        
+
     nlat = Gloc.total_density().real # lattice density
 
     # set starting guess for Sigma = U/2 at first iteration
