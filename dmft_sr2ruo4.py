@@ -12,6 +12,8 @@ from triqs.operators import util
 from timeit import default_timer as timer
 from wannier90_tools import *
 
+np.set_printoptions(precision=6,suppress=True)
+
 beta = 40.
 U = 2.3                   # hubbard U parameter
 J = 0.40                  # hubbard J parameter
@@ -19,27 +21,27 @@ nloops = 10               # number of DMFT loops needs 5-10 loops to converge
 nk = 30                   # number of k points in each dimension
 density_required = 4.     # target density for setting the chemical potential
 n_orb = 3                 # number of orbitals
-mu = 11.3715              # chemical potential 
+mu = 11.3715              # chemical potential
 add_spin = False
 w90_seedname = 'sr2ruo4'
 w90_pathname = './'
 
-outfile = 'U%.1f'%U
+outfile = 'sro_U%.1f'%U
 
 p = {}
 # solver
 p["random_seed"] = 123 * mpi.rank + 567
-p["length_cycle"] = 120
+p["length_cycle"] = 200
 p["n_warmup_cycles"] = int(1e4)
-p["n_cycles"] = int(1e7/mpi.size)
+p["n_cycles"] = int(4e7/mpi.size)
 # tail fit
 # turn this off to get the raw QMC results without fitting
 p["perform_tail_fit"] = True
 p["fit_max_moment"] = 4
-p["fit_min_w"] = 5
-p["fit_max_w"] = 15
+p["fit_min_w"] = 3
+p["fit_max_w"] = 10
 
-S = Solver(beta=beta, gf_struct = [('up', 3), ('down', 3)])
+S = Solver(beta=beta, gf_struct = [('up', 3), ('down', 3)], n_iw = 1025, n_tau=10001)
 
 # set up interaction Hamiltonian
 Umat, Upmat = util.U_matrix_kanamori(n_orb=n_orb, U_int=U, J_hund=J)
@@ -155,15 +157,26 @@ for iteration_number in range(1,nloops+1):
     # see if the result is the same
 
     nlat = Gloc.total_density().real # lattice density
-    mpi.report('Gloc density: {:.3f}'.format(nlat))
-    # set starting guess for Sigma = U/2 at first iteration
-    if it == 1:
-        S.Sigma_iw << .5*U
+    if mpi.is_master_node():
+        print('Gloc density matrix:')
+        for block, gf in Gloc:
+            print(block)
+            print(gf.density().real)
+            print('--------------')
+        print('total occupation {:.4f}'.format(nlat))
 
     # note with DLR it is good do replace this with the Delta(tau) interface
     S.G0_iw << inverse(S.Sigma_iw + inverse(Gloc))
     # solve the impurity problem. The solver is performing the dyson equation as postprocessing
     S.solve(h_int=h_int, **p)
+
+    if mpi.is_master_node():
+        print('impurity density matrix:')
+        for block, gf in S.G_iw:
+            print(block)
+            print(gf.density().real)
+            print('--------------')
+        print('total occupation {:.4f}'.format(S.G_iw.total_density().real))
 
     # a manual dyson equation would look like this
     # S.Sigma_iw << inverse(S.G0_iw) - inverse(S.G_iw)
