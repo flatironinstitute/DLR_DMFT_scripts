@@ -17,8 +17,9 @@ beta = 40.
 t = -1.                   #nearest neighbor hopping
 tp = 0.                   #next nearest neighbor hopping
 U = 3                     # hubbard U parameter
-nloops = 50               # number of DMFT loops
+nloops = 10               # number of DMFT loops
 nk = 30                   # number of k points in each dimension
+n_orb = 1                 # number of orbitals
 density_required = 1.     # target density for setting the chemical potential
 
 eps = 10**-6              # DLR accuracy
@@ -30,26 +31,34 @@ p = {}
 p["random_seed"] = 123 * mpi.rank + 567
 p["length_cycle"] = 200
 p["n_warmup_cycles"] = int(1e4)
-p["n_cycles"] = int(1e7/mpi.size)
+p["n_cycles"] = int(1e6/mpi.size)
 
 # tail fit
 # turn this off to get the raw QMC results without fitting
-p["perform_tail_fit"] = True
-p["fit_max_moment"] = 4
-p["fit_min_w"] = 5
-p["fit_max_w"] = 15
 
-l_DLR_gloc2gloc = False
+l_tailfit = False
+if l_tailfit: 
+    p["perform_tail_fit"] = True
+    p["fit_max_moment"] = 4
+    p["fit_min_w"] = 5
+    p["fit_max_w"] = 15
+else:
+    p["perform_tail_fit"] = False
 
+l_DLR_gloc2gloc = True
 if l_DLR_gloc2gloc:
     outfile += '_gloc2gloc'
+    
+l_DLR_gtau2giw = True
+if l_DLR_gtau2giw:
+    outfile += '_gtau2giw'
 
 l_symmetrize = False
 if l_symmetrize:
     outfile += '_symmetrize'
 
 if p["perform_tail_fit"]:
-    outfile += '_fit'
+    outfile += '_tailfit'
     
 l_read = False
 if l_read:
@@ -62,16 +71,47 @@ if l_previous_runs:
 
 S = Solver(beta=beta, gf_struct = [('up', [0]), ('down', [0])])
 
+h_int = U * n('up',0) * n('down',0) #local interating hamiltonian
+
+block_lst = list(['up','down'])
+
+Gloc = S.G_iw.copy() #local Green's function
+
+def kernel_it(τ,ω): 
+    assert τ >= 0.
+    if ω > 0.:
+        return np.exp(-ω*τ)/(1+np.exp(-ω))
+    else:
+        return np.exp(ω*(1-τ))/(1+np.exp(ω))
+    
+def kernel_mf(n,ω):    
+    return 1/(ω-(2*n+1)*np.pi*1j)
+
 if l_DLR_gloc2gloc:
     rf = np.loadtxt(f'dlrrf_{round(beta)}_{eps:.1E}.dat')
-    rf.sort()
+    rf.sort()  
+    
     mf = np.loadtxt(f'dlrmf_{round(beta)}_{eps:.1E}.dat',dtype=int)
     mf.sort()
     index = mf - (-S.n_iw)
-
-h_int = U * n('up',0) * n('down',0) #local interating hamiltonian
-
-Gloc = S.G_iw.copy() #local Green's function
+    assert len(rf) == len(mf)    
+    κ_mf = np.zeros((len(mf),len(rf)),dtype=complex)
+    for i,n in enumerate(mf):
+        for j,ω in enumerate(rf):
+            κ_mf[i,j] = kernel_mf(n,ω)
+    
+    mf_all = np.array([round((iw.value.imag*beta/np.pi-1)/2) for iw in Gloc.mesh])
+    assert np.abs(mf_all[0]) == S.n_iw
+    κ_mf_all = np.zeros((len(mf_all),len(rf)),dtype=complex)
+    for i,n in enumerate(mf_all):
+        for j,ω in enumerate(rf):
+            κ_mf_all[i,j] = kernel_mf(n,ω)
+    
+    it_all = np.arange(0,S.n_tau) / S.n_tau
+    κ_it_all = np.zeros((len(it_all),len(rf)))
+    for i,τ in enumerate(it_all):
+        for j,ω in enumerate(rf):
+            κ_it_all[i,j] = kernel_it(τ,ω)
 
 hop= {  (1,0)  :  [[ t]],
         (-1,0) :  [[ t]],
@@ -196,39 +236,19 @@ def DLR_gtau2giw(S,beta,eps):
     
     α = {}
     
-    rf = np.loadtxt(f'dlrrf_{round(beta)}_{eps:.1E}.dat')
-    rf.sort()
-    
-    block_lst = list(['up','down'])
-    
+    from scipy.linalg import lstsq
+
     for i, block in enumerate(block_lst,1):
+        for i_orb in range(n_orb):
+            for j_orb in range(n_orb):
+                α[block] = np.array(lstsq(κ_it_all,S.G_tau[block].data[:,i_orb,j_orb].real)[0])
 
-        it = np.array([i / beta for i in S.G_tau[block].mesh.values()])
+                tail_shift = ( np.sum(α[block]) + 1.0 ) / 2 
+                α[block][0] -= tail_shift
+                α[block][-1] -= tail_shift
 
-        κ_it = np.zeros((len(it),len(rf)))
-        for i,τ in enumerate(it):
-            for j,ω in enumerate(rf):
-                κ_it[i,j] = kernel_it(τ,ω)
-
-        from scipy.linalg import lstsq
-        α[block] = np.array(lstsq(κ_it,S.G_tau[block].data[:, 0, 0].real)[0])
-        
-        tail_shift = ( np.sum(α[block]) + 1.0 ) / 2 
-        α[block][0] -= tail_shift
-        α[block][-1] -= tail_shift
-        
-        S.G_tau[block].data[:, 0, 0] = (κ_it@α[block]).astype(complex)
-        
-    for i, block in enumerate(block_lst,1):
-        
-        mf = np.array([round((iω.imag*beta/np.pi-1)/2) for iω in S.G_iw[block].mesh.values()])
-        
-        κ_mf = np.zeros((len(mf),len(rf)),dtype=complex)
-        for i,n in enumerate(mf):
-            for j,ω in enumerate(rf):
-                κ_mf[i,j] = kernel_mf(n,ω)
-        
-        S.G_iw[block].data[:, 0, 0] = (κ_mf@α[block]*beta).astype(complex)
+                S.G_tau[block].data[:,i_orb,j_orb] = (κ_it_all@α[block]).astype(complex)
+                S.G_iw[block].data[:,i_orb,j_orb] = (κ_mf_all@α[block]*beta).astype(complex)
 
     return
 
@@ -236,24 +256,14 @@ def DLR_g02g0(S,beta,eps):
     
     α = {}
     
-    rf = np.loadtxt(f'dlrrf_{round(beta)}_{eps:.1E}.dat')
-    rf.sort()
+    from scipy.linalg import lstsq
     
-    block_lst = list(['up','down'])
-    
-    for i, block in enumerate(block_lst,1):
-        
-        mf = np.array([round((iω.imag*beta/np.pi-1)/2) for iω in S.G0_iw[block].mesh.values()])
-        
-        κ_mf = np.zeros((len(mf),len(rf)),dtype=complex)
-        for i,n in enumerate(mf):
-            for j,ω in enumerate(rf):
-                κ_mf[i,j] = kernel_mf(n,ω)
-        
-        from scipy.linalg import lstsq
-        α[block] = np.array(lstsq(κ_mf,S.G0_iw[block].data[:, 0, 0])[0])
-        
-        S.G0_iw[block].data[:, 0, 0] = (κ_mf@α[block]).astype(complex)
+    for i, block in enumerate(block_lst,1):    
+        for i_orb in range(n_orb):
+            for j_orb in range(n_orb):
+                
+                α[block] = np.array(lstsq(κ_mf_all,S.G0_iw[block].data[:,i_orb,j_orb])[0])
+                S.G0_iw[block].data[:,i_orb,j_orb] = (κ_mf_all@α[block]).astype(complex)
     
     return
 
@@ -261,26 +271,10 @@ def DLR_gloc2gloc(Gloc,beta,eps):
     
     α = {}
     
-#     rf = np.loadtxt(f'dlrrf_{round(beta)}_{eps:.1E}.dat')
-#     rf.sort()
-    
-#     mf = np.loadtxt(f'dlrmf_{round(beta)}_{eps:.1E}.dat',dtype=int)
-#     mf.sort()
-#     index = mf - (-S.n_iw)
-    
-    assert len(rf) == len(mf)
-    
-    block_lst = list(['up','down'])
-    
     for i, block in enumerate(block_lst,1):
         
-        κ_mf = np.zeros((len(mf),len(rf)),dtype=complex)
-        for i,n in enumerate(mf):
-            for j,ω in enumerate(rf):
-                κ_mf[i,j] = kernel_mf(n,ω)
-        
 #         from scipy.linalg import lstsq
-#         α[block] = np.array(lstsq(κ_mf,Gloc[block].data[index, 0, 0])[0])
+#         α[block] = np.array(lstsq(κ_mf,Gloc[block].data[index,i_orb,j_orb])[0])
         
 #         min ||A @ x - b||
 #         subject to  C @ x = d
@@ -292,26 +286,21 @@ def DLR_gloc2gloc(Gloc,beta,eps):
 #         x = lapack.dgglse(A, C, b, d)[3]
     
 #         from scipy.linalg import lapack
-#         x = lapack.zgglse(κ_mf, np.ones([1,len(rf)]), Gloc[block].data[index, 0, 0], np.array([[1]]))[3]
-    
-        α[block] = np.linalg.solve(κ_mf,Gloc[block].data[index, 0, 0])
-    
-        tail_shift = ( np.sum(α[block]) + beta ) / 2 
-        α[block][0] -= tail_shift
-        α[block][-1] -= tail_shift
+#         x = lapack.zgglse(κ_mf, np.ones([1,len(rf)]), Gloc[block].data[index,i_orb,j_orb], np.array([[1]]))[3]
+                        
+        for i_orb in range(n_orb):
+            for j_orb in range(n_orb):
+                
+                α[block] = np.linalg.solve(κ_mf,Gloc[block].data[index,i_orb,j_orb])
+                
+                if i_orb == j_orb:
+                    tail_shift = ( np.sum(α[block]) + beta ) / 2 
+                    α[block][0] -= tail_shift
+                    α[block][-1] -= tail_shift
+
+                Gloc[block].data[:,i_orb,j_orb] = (κ_mf_all@α[block]).astype(complex)
         
-        mf_all = np.array([round((iω.imag*beta/np.pi-1)/2) for iω in Gloc[block].mesh.values()])
-        
-        assert np.abs(mf_all[0]) == S.n_iw
-        
-        κ_mf_all = np.zeros((len(mf_all),len(rf)),dtype=complex)
-        for i,n in enumerate(mf_all):
-            for j,ω in enumerate(rf):
-                κ_mf_all[i,j] = kernel_mf(n,ω)
-        
-        Gloc[block].data[:, 0, 0] = (κ_mf_all@α[block]).astype(complex)
-        
-#         symmetrize(Gloc[block].data[:, 0, 0])
+#                 symmetrize(Gloc[block].data[:, i_orb, j_orb])
     
     return
 
@@ -408,9 +397,10 @@ for iteration_number in range(1,nloops+1):
         S.G0_iw['up'] << .5*(S.G0_iw['up'] + S.G0_iw['down'])
         S.G0_iw['down'] << S.G0_iw['up']
 
-        block_lst = list(['up','down'])
         for i, block in enumerate(block_lst,1):
-            symmetrize(S.G0_iw[block].data[:,0,0])
+            for i_orb in range(n_orb):
+                for j_orb in range(n_orb):
+                    symmetrize(S.G0_iw[block].data[:,i_orb,j_orb])
     
     if mpi.is_master_node():
         ar = HDFArchive(outfile+'.h5','a')
@@ -434,9 +424,10 @@ for iteration_number in range(1,nloops+1):
     
     # solve the impurity problem. The solver is performing the dyson equation as postprocessing
     S.solve(h_int=h_int, **p)
-        
-#     DLR_gtau2giw(S,beta,eps)    
-#     S.Sigma_iw << inverse(S.G0_iw) - inverse(S.G_iw)
+    
+    if l_DLR_gtau2giw:
+        DLR_gtau2giw(S,beta,eps)    
+        S.Sigma_iw << inverse(S.G0_iw) - inverse(S.G_iw)
     
     # a manual dyson equation would look like this:
     # S.Sigma_iw << inverse(S.G0_iw) - inverse(S.G_iw)
