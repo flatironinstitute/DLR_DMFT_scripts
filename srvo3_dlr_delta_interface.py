@@ -131,7 +131,7 @@ if l_DLR_gloc2gloc or l_DLR_gtau2giw or l_DLR_g02g0:
         for j,ω in enumerate(rf):
             κ_mf_all[i,j] = kernel_mf(n,ω)
 
-    it_all = np.arange(0,S.n_tau) / S.n_tau
+    it_all = np.arange(0,S.n_tau) / ( S.n_tau - 1 )
     κ_it_all = np.zeros((len(it_all),len(rf)))
     for i,τ in enumerate(it_all):
         for j,ω in enumerate(rf):
