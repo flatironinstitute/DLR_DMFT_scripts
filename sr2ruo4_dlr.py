@@ -305,7 +305,10 @@ for iteration_number in range(1,nloops+1):
     # TODO step 3 write a new python function which replaces the SK() call which accepts a iw_vector and does the k sum only on these frequencies
     start_time = timer()
     # Gloc << SK(mu = mu, Sigma = S.Sigma_iw)
-    Gloc << sumk(mu = mu, Sigma= S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping)
+    if grid == 'DLR':
+        Gloc << sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping, iw_index=index)
+    else:
+        Gloc << sumk(mu = mu, Sigma= S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping)
     mpi.barrier()
     mpi.report('time for k sum: {:.2f} s'.format(timer() - start_time))
     # TODO step 1
