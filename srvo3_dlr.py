@@ -19,7 +19,7 @@ np.set_printoptions(precision=6,suppress=False)
 beta = 40.
 U = 8.0                   # hubbard U parameter
 J = 0.65                  # hubbard J parameter
-nloops = 100              # number of DMFT loops needs 5-10 loops to converge
+nloops = 20               # number of DMFT loops needs 5-10 loops to converge
 nk = 21                   # number of k points in each dimension
 density_required = 1.     # target density for setting the chemical potential
 n_orb = 3                 # number of orbitals
