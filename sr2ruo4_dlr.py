@@ -318,7 +318,7 @@ for iteration_number in range(1,nloops+1):
     start_time = timer()
     # Gloc << SK(mu = mu, Sigma = S.Sigma_iw)
     if grid == 'DLR':
-        Gloc << sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping, iw_index=index, keepvalue=True)
+        Gloc << sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping, iw_index=index, tailfit=True, keepvalue=True)
     else:
         Gloc << sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping)
     mpi.barrier()
@@ -372,18 +372,14 @@ for iteration_number in range(1,nloops+1):
             S.Delta_tau[name] << make_gf_from_fourier(Delta_iw[name], S.Delta_tau.mesh, tail).real
         
     if grid == 'DLR':
-        
-        for name, g0 in G0_iw:
-            G0_iw[name] << make_hermitian(g0)
-        
         for name, D_tau in S.Delta_tau:
             S.Delta_tau[name] << make_hermitian(D_tau)
     
     if mpi.is_master_node():
         ar = HDFArchive(outfile+'.h5','a')
         ar['iterations'] = it
-        ar['G_0'] = G0_iw
-        ar['G_0-%s'%it] = G0_iw
+#         ar['G_0'] = G0_iw
+#         ar['G_0-%s'%it] = G0_iw
         ar['Delta_tau'] = S.Delta_tau
         ar['Delta_tau-%s'%it] = S.Delta_tau
 #         ar['G_tau'] = S.G_tau
@@ -431,16 +427,26 @@ for iteration_number in range(1,nloops+1):
     nimp = S.G_iw.total_density().real  #impurity density
     mpi.report('Impurity density is {:.4f}'.format(nimp))
 
+    if grid == 'DLR':
+        DLR_gloc2gloc(G0_iw,tailfit=True,keepvalue=False)
+        
     if mpi.is_master_node():
         ar = HDFArchive(outfile+'.h5','a')
 #         ar['iterations'] = it
-#         ar['G_0'] = G0_iw
         ar['G_tau'] = S.G_tau
         ar['G_tau-%s'%it] = S.G_tau
         ar['G_iw'] = S.G_iw
         ar['G_iw-%s'%it] = S.G_iw
-        ar['Sigma_iw'] = S.Sigma_iw
-        ar['Sigma_iw-%s'%it] = S.Sigma_iw
+        if grid == 'DLR':
+            ar['Sigma_iw'] = make_hermitian(inverse(G0_iw) - inverse(S.G_iw))
+            ar['Sigma_iw-%s'%it] = ar['Sigma_iw'] 
+            for name, g0 in G0_iw:
+                G0_iw[name] << make_hermitian(g0)
+        else:
+            ar['Sigma_iw'] = S.Sigma_iw
+            ar['Sigma_iw-%s'%it] = S.Sigma_iw
+        ar['G_0'] = G0_iw
+        ar['G_0-%s'%it] = G0_iw
         ar['nimp-%s'%it] = nimp
         ar['nlat-%s'%it] = nlat
         ar['mu-%s'%it] = mu
