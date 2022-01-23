@@ -10,6 +10,7 @@ from h5 import HDFArchive
 from triqs.operators import util
 from triqs.lattice.utils import k_space_path, TB_from_wannier90
 from triqs.operators import c_dag, c, Operator
+from copy import deepcopy
 
 from timeit import default_timer as timer
 from wannier90_tools import *
@@ -19,7 +20,7 @@ np.set_printoptions(precision=6,suppress=True)
 beta = 40.
 U = 2.3                   # hubbard U parameter
 J = 0.40                  # hubbard J parameter
-nloops = 100              # number of DMFT loops needs 5-10 loops to converge
+nloops = 1                # number of DMFT loops needs 5-10 loops to converge
 nk = 30                   # number of k points in each dimension
 density_required = 4.     # target density for setting the chemical potential
 n_orb = 3                 # number of orbitals
@@ -128,10 +129,13 @@ SK = SumkDiscreteFromLattice(lattice=L, n_points=nk)
 e0 = L.hoppings[(0, 0, 0)]
 mpi.report('epsilon0 (impurity energies):\n',e0.real)
 
-def sumk(mu, Sigma, bz_weights, hopping, iw_index = None):
+def sumk(mu, Sigma, bz_weights, hopping, iw_index = None, tailfit = False, keepvalue = False):
     '''
     calc Gloc with mpi parallelism
     '''
+    if tailfit or keepvalue:
+        assert isinstance(iw_index,(np.ndarray,list))
+        
     Gloc = Sigma.copy()
     Gloc << 0.0+0.0j
 
@@ -140,7 +144,7 @@ def sumk(mu, Sigma, bz_weights, hopping, iw_index = None):
     if isinstance(iw_index,(np.ndarray,list)):
         iw_values =  np.array(list(Gloc.mesh.values()))[iw_index]
         iw_mat = np.array([iw * np.eye(n_orb) for iw in iw_values])
-        
+
         mu_mat = mu * np.eye(n_orb)
 
         #Loop on k points...
@@ -150,7 +154,7 @@ def sumk(mu, Sigma, bz_weights, hopping, iw_index = None):
                 # numpy vectorizes the inversion automatically of shape [nw,orb,orb] over nw
                 # speed up factor 30, comparable to C++!
                 gf.data[iw_index,:,:] += wk*np.linalg.inv(iw_mat[:] + mu_mat - eps_k - Sigma[block].data[iw_index,:,:])
-                
+
     else:
         iw_mat = np.array([iw.value * np.eye(n_orb) for iw in Gloc.mesh])
 
@@ -168,7 +172,7 @@ def sumk(mu, Sigma, bz_weights, hopping, iw_index = None):
     mpi.barrier()
     
     if isinstance(iw_index,(np.ndarray,list)):
-        DLR_gloc2gloc(Gloc)
+        DLR_gloc2gloc(Gloc,tailfit,keepvalue)
 
     return Gloc
 
@@ -184,7 +188,7 @@ def Dens(mu):
 # function to determine density python only
 def dens_dlr(mu):
     if grid == 'DLR':
-        dens =  sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping, iw_index=index).total_density()
+        dens =  sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping, iw_index=index, tailfit = True).total_density()
     else:
         dens =  sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping).total_density()
     if abs(dens.imag) > 1e-20:
@@ -209,7 +213,7 @@ def DLR_gtau2giw(S):
 
     return
 
-def DLR_gloc2gloc(Gloc):
+def DLR_gloc2gloc(Gloc,tailfit,keepvalue):
 
     α = {}
 
@@ -226,13 +230,21 @@ def DLR_gloc2gloc(Gloc):
             for j_orb in range(n_orb):
                 
                 α[block] = np.linalg.solve(κ_mf,Gloc[block].data[index,i_orb,j_orb])
-                if i_orb == j_orb:
-                    tail_shift = ( np.sum(α[block]) + beta ) / 2
-                    α[block][0] -= tail_shift
-                    α[block][-1] -= tail_shift
+                
+                if keepvalue:
+                    tmp = deepcopy(Gloc[block].data[index,i_orb,j_orb])
                     
+                if tailfit:
+                    if i_orb == j_orb:
+                        tail_shift = ( np.sum(α[block]) + beta ) / 2
+                        α[block][0] -= tail_shift
+                        α[block][-1] -= tail_shift
+                        
                 Gloc[block].data[:,i_orb,j_orb] = (κ_mf_all@α[block]).astype(complex)
-                    
+                
+                if keepvalue:
+                    Gloc[block].data[index,i_orb,j_orb] = tmp
+
 #                 if type_DLR_gloc2gloc == 'constrained':
 #                     if i_orb == j_orb:
 #                         α[block] = lapack.zgglse(κ_mf, np.ones([1,len(rf)]), Gloc[block].data[index,i_orb,j_orb], np.array([[1]]))[3]
@@ -306,7 +318,7 @@ for iteration_number in range(1,nloops+1):
     start_time = timer()
     # Gloc << SK(mu = mu, Sigma = S.Sigma_iw)
     if grid == 'DLR':
-        Gloc << sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping, iw_index=index)
+        Gloc << sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping, iw_index=index, keepvalue=True)
     else:
         Gloc << sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping)
     mpi.barrier()
@@ -347,13 +359,6 @@ for iteration_number in range(1,nloops+1):
     
     G0_iw << inverse(S.Sigma_iw + inverse(Gloc))
     
-    if grid == 'DLR':
-        G0_iw['up'] << .5*(G0_iw['up'] + G0_iw['down'])
-        G0_iw['down'] << G0_iw['up']
-        
-        for name, g0 in G0_iw:
-            G0_iw[name] << make_hermitian(g0)
-    
     Delta_iw = G0_iw.copy()
     Delta_iw << 0.0+0.0j
     for name, g0 in G0_iw:
@@ -367,8 +372,9 @@ for iteration_number in range(1,nloops+1):
             S.Delta_tau[name] << make_gf_from_fourier(Delta_iw[name], S.Delta_tau.mesh, tail).real
         
     if grid == 'DLR':
-        S.Delta_tau['up'] << .5*(S.Delta_tau['up'] + S.Delta_tau['down'])
-        S.Delta_tau['down'] << S.Delta_tau['up']
+        
+        for name, g0 in G0_iw:
+            G0_iw[name] << make_hermitian(g0)
         
         for name, D_tau in S.Delta_tau:
             S.Delta_tau[name] << make_hermitian(D_tau)
@@ -439,4 +445,3 @@ for iteration_number in range(1,nloops+1):
         ar['nlat-%s'%it] = nlat
         ar['mu-%s'%it] = mu
         del ar
-
