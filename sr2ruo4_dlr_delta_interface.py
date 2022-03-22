@@ -10,8 +10,8 @@ from h5 import HDFArchive
 from triqs.operators import util
 from triqs.lattice.utils import k_space_path, TB_from_wannier90
 from triqs.operators import c_dag, c, Operator
-from copy import deepcopy
 
+from copy import deepcopy
 from timeit import default_timer as timer
 from wannier90_tools import *
 
@@ -20,23 +20,25 @@ np.set_printoptions(precision=6,suppress=True)
 beta = 40.
 U = 2.3                   # hubbard U parameter
 J = 0.40                  # hubbard J parameter
-nloops = 20               # number of DMFT loops needs 5-10 loops to converge
-nk = 30                   # number of k points in each dimension
+nloops = 40               # number of DMFT loops needs 5-10 loops to converge
+nk = 40                   # number of k points in each dimension
 density_required = 4.     # target density for setting the chemical potential
 n_orb = 3                 # number of orbitals
 mu = 11.3715              # chemical potential
+mix = 0.8                 # mixing factor
 add_spin = False
 w90_seedname = 'sr2ruo4'
 w90_pathname = './'
 
 eps = 10**-6              # DLR accuracy
+omega_max = 12            # DLR frequency cutoff
 
-outfile = f'U{U:.1F}_{eps:.1E}'
+outfile = f'{int(beta)}_{int(omega_max)}_{eps:.1E}'
 
 p = {}
 # solver
 p["random_seed"] = 123 * mpi.rank + 567
-p["length_cycle"] = 200
+p["length_cycle"] = 120
 p["n_warmup_cycles"] = int(1e4)
 p["n_cycles"] = int(4e7/mpi.size)
 p["imag_threshold"] = 1e-8
@@ -44,16 +46,19 @@ p["off_diag_threshold"] = 1e-6
 
 # tail fit
 # turn this off to get the raw QMC results without fitting
-tailfit = 'DLR'
-assert tailfit in ['TRIQS','DLR','off']
+tailfit = 'TRIQS'
+assert tailfit in ['TRIQS','DLR','L','off']
 if tailfit == 'TRIQS':
     p["perform_tail_fit"] = True
-    p["fit_max_moment"] = 4
-    p["fit_min_w"] = 5
-    p["fit_max_w"] = 12
+    p["fit_max_moment"] = 10
+    p["fit_min_w"] = 2
+    p["fit_max_w"] = 6
 elif tailfit == 'DLR':
     p["perform_tail_fit"] = False
     from scipy.linalg import lstsq
+elif tailfit == 'L':
+    p["perform_tail_fit"] = False
+    p["measure_G_l"] = True
 elif tailfit == 'off':
     p["perform_tail_fit"] = False  
 outfile += f'_tailfit_{tailfit}'
@@ -71,7 +76,19 @@ l_previous_runs = False
 if l_previous_runs:
     previous_runs = 7
 
-S = Solver(beta=beta, gf_struct = [('up', 3), ('down', 3)], n_iw = 1025, n_tau=10001, delta_interface=True)
+n_iw = 1025
+if tailfit == 'DLR' or grid == 'DLR':
+    rf = np.loadtxt(f'dlrrf_{round(beta)}_{round(omega_max)}_{eps:.1E}.dat')
+    rf.sort()
+    
+    mf = np.loadtxt(f'dlrmf_{round(beta)}_{round(omega_max)}_{eps:.1E}.dat',dtype=int)
+    mf.sort()
+    if mf[0] + mf[-1] >= -1 and mf[-1] > n_iw - 1:
+        n_iw = mf[-1] + 1
+    elif mf[0] + mf[-1] < -1 and mf[0] < -n_iw:
+        n_iw = -mf[0]
+    
+S = Solver(beta=beta, gf_struct = [('up', 3), ('down', 3)], n_iw = n_iw, n_tau=10001, delta_interface=True, n_l = 31)
 
 block_lst = list(['up','down'])
 
@@ -81,29 +98,25 @@ h_int = util.h_int_kanamori(['up', 'down'], range(n_orb), off_diag=True, U=Umat,
 
 Gloc = S.G_iw.copy() #local Green's function
 
-def kernel_it(τ,ω): 
-    assert τ >= 0.
-    if ω > 0.:
-        return np.exp(-ω*τ)/(1+np.exp(-ω))
-    else:
-        return np.exp(ω*(1-τ))/(1+np.exp(ω))
-    
-def kernel_mf(n,ω):    
-    return 1/(ω-(2*n+1)*np.pi*1j)
-
 if tailfit == 'DLR' or grid == 'DLR':
-    rf = np.loadtxt(f'dlrrf_{round(beta)}_{eps:.1E}.dat')
-    rf.sort()
     
-    mf = np.loadtxt(f'dlrmf_{round(beta)}_{eps:.1E}.dat',dtype=int)
-    mf.sort()
+    def kernel_it(τ,ω): 
+        assert τ >= 0.
+        if ω > 0.:
+            return np.exp(-ω*τ)/(1+np.exp(-ω))
+        else:
+            return np.exp(ω*(1-τ))/(1+np.exp(ω))
+    
+    def kernel_mf(n,ω):    
+        return 1/(ω-(2*n+1)*np.pi*1j)
+    
     index = mf - (-S.n_iw)
     assert len(rf) == len(mf)
     κ_mf = np.zeros((len(mf),len(rf)),dtype=complex)
     for i,n in enumerate(mf):
         for j,ω in enumerate(rf):
             κ_mf[i,j] = kernel_mf(n,ω)
-    
+            
     mf_all = np.array([round((iw.value.imag*beta/np.pi-1)/2) for iw in Gloc.mesh])
     assert np.abs(mf_all[0]) == S.n_iw
     κ_mf_all = np.zeros((len(mf_all),len(rf)),dtype=complex)
@@ -124,6 +137,20 @@ H_add_loc += np.diag([-mu]*n_orb)
 L = get_TBL(path=w90_pathname, name=w90_seedname, extend_to_spin=add_spin, add_local=H_add_loc)
 
 SK = SumkDiscreteFromLattice(lattice=L, n_points=nk)
+
+# if mpi.is_master_node():
+    
+#     import pickle
+    
+#     data = {}
+#     data[f"{nk}_bz_weights"] = SK.bz_weights
+#     data[f"{nk}_hopping"] = SK.hopping
+    
+#     with open(f'{nk}.pickle', 'wb') as f:
+#         pickle.dump(data, f)
+
+# import sys
+# sys.exit()
 
 # extract epsilon0 from hoppings and add
 e0 = L.hoppings[(0, 0, 0)]
@@ -172,7 +199,7 @@ def sumk(mu, Sigma, bz_weights, hopping, iw_index = None, tailfit = False, keepv
     mpi.barrier()
     
     if isinstance(iw_index,(np.ndarray,list)):
-        DLR_gloc2gloc(Gloc,tailfit,keepvalue)
+        Gloc << DLR_gloc2gloc(Gloc,tailfit,keepvalue)
 
     return Gloc
 
@@ -188,7 +215,7 @@ def Dens(mu):
 # function to determine density python only
 def dens_dlr(mu):
     if grid == 'DLR':
-        dens =  sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping, iw_index=index, tailfit = True).total_density()
+        dens =  sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping, iw_index=index, tailfit = True, keepvalue=False).total_density()
     else:
         dens =  sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping).total_density()
     if abs(dens.imag) > 1e-20:
@@ -214,6 +241,9 @@ def DLR_gtau2giw(S):
     return
 
 def DLR_gloc2gloc(Gloc,tailfit,keepvalue):
+    
+    Gloc_ = Gloc.copy()
+    Gloc_ << 0.0+0.0j
 
     α = {}
 
@@ -240,10 +270,10 @@ def DLR_gloc2gloc(Gloc,tailfit,keepvalue):
                         α[block][0] -= tail_shift
                         α[block][-1] -= tail_shift
                         
-                Gloc[block].data[:,i_orb,j_orb] = (κ_mf_all@α[block]).astype(complex)
-                
+                Gloc_[block].data[:,i_orb,j_orb] = (κ_mf_all@α[block]).astype(complex)
+                                
                 if keepvalue:
-                    Gloc[block].data[index,i_orb,j_orb] = tmp
+                    Gloc_[block].data[index,i_orb,j_orb] = tmp
 
 #                 if type_DLR_gloc2gloc == 'constrained':
 #                     if i_orb == j_orb:
@@ -252,7 +282,7 @@ def DLR_gloc2gloc(Gloc,tailfit,keepvalue):
 #                         α[block] = np.linalg.solve(κ_mf,Gloc[block].data[index,i_orb,j_orb])
 #                 symmetrize(Gloc[block].data[:, i_orb, j_orb])
 
-    return
+    return Gloc_
 
 def DLR_Diw2Dtau(S,Delta_iw):
     
@@ -263,7 +293,7 @@ def DLR_Diw2Dtau(S,Delta_iw):
             for j_orb in range(n_orb):
                 α[block] = np.linalg.solve(κ_mf,Delta_iw[block].data[index,i_orb,j_orb])
 
-                S.Delta_tau[block].data[:,i_orb,j_orb] = κ_it_all@α[block] / beta
+                S.Delta_tau[block].data[:,i_orb,j_orb] = ( κ_it_all@α[block] / beta ).real
             
     return
 
@@ -299,10 +329,6 @@ for iteration_number in range(1,nloops+1):
         print("Iteration = %s"%it)
         print('-----------------------------------------------')
 
-    if it > 1:
-        S.Sigma_iw['up'] << .5*(S.Sigma_iw['up'] + S.Sigma_iw['down'])
-        S.Sigma_iw['down'] << S.Sigma_iw['up']
-
     # determination of the next chemical potential via function Dens. Involves k summation
     start_time = timer()
     #mu, density = dichotomy(Dens, mu, density_required, 1e-4, .5, max_loops = 100, x_name="chemical potential", y_name="density", verbosity=3)
@@ -330,11 +356,14 @@ for iteration_number in range(1,nloops+1):
     # DLR fit
     # evaluate DLR fit at all iw frequencies
     # see if the result is the same
-
-    nlat = Gloc.total_density().real # lattice density
+    
+    Gloc_ = Gloc.copy()
+    if grid == 'DLR':
+        Gloc_ << DLR_gloc2gloc(Gloc,tailfit=True,keepvalue=False)
+    nlat = Gloc_.total_density().real # lattice density
     if mpi.is_master_node():
         print('Gloc density matrix:')
-        for block, gf in Gloc:
+        for block, gf in Gloc_:
             print(block)
             print(gf.density().real)
             print('--------------')
@@ -370,16 +399,12 @@ for iteration_number in range(1,nloops+1):
             tail, err = fit_hermitian_tail(Delta_iw[name], known_moments)
             mpi.report('tail fit error Delta_iw for block {}: {}'.format(name,err))
             S.Delta_tau[name] << make_gf_from_fourier(Delta_iw[name], S.Delta_tau.mesh, tail).real
-        
-    if grid == 'DLR':
-        for name, D_tau in S.Delta_tau:
-            S.Delta_tau[name] << make_hermitian(D_tau)
     
     if mpi.is_master_node():
         ar = HDFArchive(outfile+'.h5','a')
         ar['iterations'] = it
-#         ar['G_0'] = G0_iw
-#         ar['G_0-%s'%it] = G0_iw
+        ar['G_0'] = G0_iw
+        ar['G_0-%s'%it] = G0_iw
         ar['Delta_tau'] = S.Delta_tau
         ar['Delta_tau-%s'%it] = S.Delta_tau
 #         ar['G_tau'] = S.G_tau
@@ -391,9 +416,13 @@ for iteration_number in range(1,nloops+1):
         ar['Gloc'] = Gloc
         ar['Gloc-%s'%it] = Gloc
 #         ar['nimp-%s'%it] = nimp
-#         ar['nlat-%s'%it] = nlat
-#         ar['mu-%s'%it] = mu
+        ar['nlat-%s'%it] = nlat
+        ar['mu-%s'%it] = mu
         del ar
+    
+    if grid == 'DLR':
+        for name, D_tau in S.Delta_tau:
+            S.Delta_tau[name] << make_hermitian(D_tau)
 
     # solve the impurity problem. The solver is performing the dyson equation as postprocessing
     S.solve(h_int=h_int, **p)
@@ -401,14 +430,19 @@ for iteration_number in range(1,nloops+1):
     if tailfit == 'DLR':
         DLR_gtau2giw(S)    
         S.Sigma_iw << inverse(G0_iw) - inverse(S.G_iw)
-
+    
+    G_iw = S.G_iw.copy()
+    if grid == 'DLR':
+        G_iw << DLR_gloc2gloc(S.G_iw,tailfit=True,keepvalue=False)
+    nimp = G_iw.total_density().real #impurity density
     if mpi.is_master_node():
         print('impurity density matrix:')
-        for block, gf in S.G_iw:
+        for block, gf in G_iw:
             print(block)
             print(gf.density().real)
             print('--------------')
-        print('total occupation {:.4f}'.format(S.G_iw.total_density().real))
+        print('total occupation {:.4f}'.format(nimp))
+    mpi.report('Impurity density is {:.4f}'.format(nimp))
 
     # a manual dyson equation would look like this
     # S.Sigma_iw << inverse(G0_iw) - inverse(S.G_iw)
@@ -423,12 +457,9 @@ for iteration_number in range(1,nloops+1):
     
     S.Sigma_iw['up'] << .5*(S.Sigma_iw['up'] + S.Sigma_iw['down'])
     S.Sigma_iw['down'] << S.Sigma_iw['up']
-
-    nimp = S.G_iw.total_density().real  #impurity density
-    mpi.report('Impurity density is {:.4f}'.format(nimp))
-
-    if grid == 'DLR':
-        DLR_gloc2gloc(G0_iw,tailfit=True,keepvalue=False)
+      
+#     if grid == 'DLR':
+#         DLR_gloc2gloc(G0_iw,tailfit=True,keepvalue=False)
         
     if mpi.is_master_node():
         ar = HDFArchive(outfile+'.h5','a')
@@ -437,17 +468,25 @@ for iteration_number in range(1,nloops+1):
         ar['G_tau-%s'%it] = S.G_tau
         ar['G_iw'] = S.G_iw
         ar['G_iw-%s'%it] = S.G_iw
-        if grid == 'DLR':
-            ar['Sigma_iw'] = make_hermitian(inverse(G0_iw) - inverse(S.G_iw))
-            ar['Sigma_iw-%s'%it] = ar['Sigma_iw'] 
-            for name, g0 in G0_iw:
-                G0_iw[name] << make_hermitian(g0)
-        else:
-            ar['Sigma_iw'] = S.Sigma_iw
-            ar['Sigma_iw-%s'%it] = S.Sigma_iw
-        ar['G_0'] = G0_iw
-        ar['G_0-%s'%it] = G0_iw
+#         if grid == 'DLR':
+#             ar['Sigma_iw'] = make_hermitian(inverse(G0_iw) - inverse(S.G_iw))
+#             ar['Sigma_iw-%s'%it] = ar['Sigma_iw'] 
+#             for name, g0 in G0_iw:
+#                 G0_iw[name] << make_hermitian(g0)
+#         else:
+#             ar['Sigma_iw'] = S.Sigma_iw
+#             ar['Sigma_iw-%s'%it] = S.Sigma_iw
+#         ar['G_0'] = G0_iw
+#         ar['G_0-%s'%it] = G0_iw
+        ar['Sigma_iw'] = S.Sigma_iw
+        ar['Sigma_iw-%s'%it] = S.Sigma_iw
         ar['nimp-%s'%it] = nimp
-        ar['nlat-%s'%it] = nlat
-        ar['mu-%s'%it] = mu
+#         ar['nlat-%s'%it] = nlat
+#         ar['mu-%s'%it] = mu
+        if it > 1 or previous_present:
+            S.Sigma_iw << mix * S.Sigma_iw + (1.0-mix) * ar['Sigma_iw-%s'%(it-1)]
         del ar
+        
+    if it > 1 or previous_present:    
+        S.Sigma_iw << mpi.bcast(S.Sigma_iw)
+    

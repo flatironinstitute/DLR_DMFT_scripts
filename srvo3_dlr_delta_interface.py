@@ -11,6 +11,7 @@ from triqs.operators import util
 from triqs.lattice.utils import k_space_path, TB_from_wannier90
 from triqs.operators import c_dag, c, Operator
 
+from copy import deepcopy
 from timeit import default_timer as timer
 
 np.set_printoptions(precision=6,suppress=False)
@@ -18,74 +19,56 @@ np.set_printoptions(precision=6,suppress=False)
 beta = 40.
 U = 8.0                   # hubbard U parameter
 J = 0.65                  # hubbard J parameter
-nloops = 10             # number of DMFT loops needs 5-10 loops to converge
-nk = 21                   # number of k points in each dimension
+nloops = 40               # number of DMFT loops needs 5-10 loops to converge
+nk = 40                   # number of k points in each dimension
 density_required = 1.     # target density for setting the chemical potential
 n_orb = 3                 # number of orbitals
 mu = 12.3958              # chemical potential
+mix = 0.8                 # mixing factor
 add_spin = False
 w90_seedname = 'srvo3'
 w90_pathname = './'
 
 eps = 10**-6              # DLR accuracy
+omega_max = 12            # DLR frequency cutoff
 
-outfile = f'U{U:.1F}_{eps:.1E}'
+outfile = f'{int(beta)}_{int(omega_max)}_{eps:.1E}'
 
 p = {}
 # solver
 p["random_seed"] = 123 * mpi.rank + 567
 p["length_cycle"] = 120
-p["n_warmup_cycles"] = int(1e5)
+p["n_warmup_cycles"] = int(1e4)
 p["n_cycles"] = int(4e7/mpi.size)
-# p["imag_threshold"] = 1e-07
 p["imag_threshold"] = 1e-8
 p["off_diag_threshold"] = 1e-6
+
 # tail fit
 # turn this off to get the raw QMC results without fitting
-l_tailfit = True
-if l_tailfit:
+tailfit = 'TRIQS'
+assert tailfit in ['TRIQS','DLR','L','off']
+if tailfit == 'TRIQS':
     p["perform_tail_fit"] = True
-    p["fit_max_moment"] = 4
-    p["fit_min_w"] = 5
-    p["fit_max_w"] = 12
-else:
+    p["fit_max_moment"] = 6
+    p["fit_min_w"] = 2
+    p["fit_max_w"] = 5
+elif tailfit == 'DLR':
     p["perform_tail_fit"] = False
+    from scipy.linalg import lstsq
+elif tailfit == 'L':
+    p["perform_tail_fit"] = False
+    p["measure_G_l"] = True
+elif tailfit == 'off':
+    p["perform_tail_fit"] = False  
+outfile += f'_tailfit_{tailfit}'
 
-l_DLR_gloc2gloc = False
-type_DLR_gloc2gloc = 'crude'
-if l_DLR_gloc2gloc:
-    outfile += '_gloc2gloc'
-    outfile += f'_{type_DLR_gloc2gloc}'
-    if type_DLR_gloc2gloc == 'crude':
-        from scipy.linalg import lstsq
-    elif type_DLR_gloc2gloc == 'constrained':
-        from scipy.linalg import lapack
+grid = 'DLR'
+assert grid in ['full','DLR']
+outfile += f'_grid_{grid}'
 
-l_DLR_gtau2giw = False
-type_DLR_gtau2giw = 'crude'
-if l_DLR_gtau2giw:
-    outfile += '_gtau2giw'
-    outfile += f'_{type_DLR_gtau2giw}'
-    if type_DLR_gtau2giw == 'crude':
-        from scipy.linalg import lstsq
-    elif type_DLR_gtau2giw == 'constrained':
-        from scipy.linalg import lapack
-
-l_DLR_g02g0 = False
-type_DLR_g02g0 = 'crude'
-if l_DLR_g02g0:
-    outfile += '_g02g0'
-    outfile += f'_{type_DLR_g02g0}'
-    if type_DLR_gtau2giw == 'crude':
-        from scipy.linalg import lstsq
-
-l_symmetrize = True
-if l_symmetrize:
-    outfile += '_symmetrize'
-
-if p["perform_tail_fit"]:
-    outfile += '_tailfit'
-
+l_fix_mu = True
+fix_mu = 1.96
+    
 l_read = False
 if l_read:
     readfile = outfile
@@ -94,43 +77,51 @@ if l_read:
 l_previous_runs = False
 if l_previous_runs:
     previous_runs = 7
+    
+n_iw = 1025
+if tailfit == 'DLR' or grid == 'DLR':
+    rf = np.loadtxt(f'dlrrf_{round(beta)}_{round(omega_max)}_{eps:.1E}.dat')
+    rf.sort()
+    
+    mf = np.loadtxt(f'dlrmf_{round(beta)}_{round(omega_max)}_{eps:.1E}.dat',dtype=int)
+    mf.sort()
+    if mf[0] + mf[-1] >= -1 and mf[-1] > n_iw - 1:
+        n_iw = mf[-1] + 1
+    elif mf[0] + mf[-1] < -1 and mf[0] < -n_iw:
+        n_iw = -mf[0]
 
-S = Solver(beta=beta, gf_struct = [('up', 3), ('down', 3)], n_iw = 1025, n_tau=10001, delta_interface=True)
+S = Solver(beta=beta, gf_struct = [('up', 3), ('down', 3)], n_iw = n_iw, n_tau=10001, delta_interface=True, n_l = 31)
 
 block_lst = list(['up','down'])
 
 Gloc = S.G_iw.copy() #local Green's function
 
-def kernel_it(τ,ω):
-    assert τ >= 0.
-    if ω > 0.:
-        return np.exp(-ω*τ)/(1+np.exp(-ω))
-    else:
-        return np.exp(ω*(1-τ))/(1+np.exp(ω))
-
-def kernel_mf(n,ω):
-    return 1/(ω-(2*n+1)*np.pi*1j)
-
-if l_DLR_gloc2gloc or l_DLR_gtau2giw or l_DLR_g02g0:
-    rf = np.loadtxt(f'dlrrf_{round(beta)}_{eps:.1E}.dat')
-    rf.sort()
-
-    mf = np.loadtxt(f'dlrmf_{round(beta)}_{eps:.1E}.dat',dtype=int)
-    mf.sort()
+if tailfit == 'DLR' or grid == 'DLR':
+    
+    def kernel_it(τ,ω): 
+        assert τ >= 0.
+        if ω > 0.:
+            return np.exp(-ω*τ)/(1+np.exp(-ω))
+        else:
+            return np.exp(ω*(1-τ))/(1+np.exp(ω))
+    
+    def kernel_mf(n,ω):    
+        return 1/(ω-(2*n+1)*np.pi*1j)
+    
     index = mf - (-S.n_iw)
     assert len(rf) == len(mf)
     κ_mf = np.zeros((len(mf),len(rf)),dtype=complex)
     for i,n in enumerate(mf):
         for j,ω in enumerate(rf):
             κ_mf[i,j] = kernel_mf(n,ω)
-
+            
     mf_all = np.array([round((iw.value.imag*beta/np.pi-1)/2) for iw in Gloc.mesh])
     assert np.abs(mf_all[0]) == S.n_iw
     κ_mf_all = np.zeros((len(mf_all),len(rf)),dtype=complex)
     for i,n in enumerate(mf_all):
         for j,ω in enumerate(rf):
             κ_mf_all[i,j] = kernel_mf(n,ω)
-
+            
     it_all = np.arange(0,S.n_tau) / ( S.n_tau - 1 )
     κ_it_all = np.zeros((len(it_all),len(rf)))
     for i,τ in enumerate(it_all):
@@ -153,10 +144,13 @@ SK = SumkDiscreteFromLattice(lattice=L, n_points=nk)
 e0 = L.hoppings[(0, 0, 0)]
 mpi.report('epsilon0 (impurity energies):\n',e0.real)
 
-def sumk(mu, Sigma, bz_weights, hopping, iw_index = None):
+def sumk(mu, Sigma, bz_weights, hopping, iw_index = None, tailfit = False, keepvalue = False):
     '''
     calc Gloc with mpi parallelism
     '''
+    if tailfit or keepvalue:
+        assert isinstance(iw_index,(np.ndarray,list))
+        
     Gloc = Sigma.copy()
     Gloc << 0.0+0.0j
 
@@ -191,9 +185,9 @@ def sumk(mu, Sigma, bz_weights, hopping, iw_index = None):
 
     Gloc << mpi.all_reduce(mpi.world,Gloc,lambda x,y: x+y)
     mpi.barrier()
-
+    
     if isinstance(iw_index,(np.ndarray,list)):
-        DLR_gloc2gloc(Gloc)
+        Gloc << DLR_gloc2gloc(Gloc,tailfit,keepvalue)
 
     return Gloc
 
@@ -208,27 +202,13 @@ def Dens(mu):
 
 # function to determine density python only
 def dens_dlr(mu):
-    if l_DLR_gloc2gloc:
-        dens =  sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping, iw_index=index).total_density()
+    if grid == 'DLR':
+        dens =  sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping, iw_index=index, tailfit = True, keepvalue=False).total_density()
     else:
         dens =  sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping).total_density()
     if abs(dens.imag) > 1e-20:
             mpi.report("Warning: Imaginary part of density will be ignored ({})".format(str(abs(dens.imag))))
     return dens.real
-
-def symmetrize(vec):
-
-    assert len(vec) % 2 == 0
-
-    n_iw = round(len(vec)/2)
-
-    for n in range(n_iw):
-        real = np.real((vec[n_iw + n] + vec[n_iw - 1 - n])/2)
-        imag = np.imag((vec[n_iw + n] - vec[n_iw - 1 - n])/2)
-        vec[n_iw + n] = real + imag * 1j
-        vec[n_iw - 1 - n] = real - imag * 1j
-
-    return
 
 def DLR_gtau2giw(S):
 
@@ -237,46 +217,21 @@ def DLR_gtau2giw(S):
     for i, block in enumerate(block_lst,1):
         for i_orb in range(n_orb):
             for j_orb in range(n_orb):
-                if type_DLR_gtau2giw == 'constrained':
-                    if i_orb == j_orb:
-                        α[block] = lapack.zgglse(κ_it_all, np.ones([1,len(rf)]), S.G_tau[block].data[:,i_orb,j_orb], np.array([[1]]))[3]
-                    else:
-                        α[block] = np.array(lstsq(κ_it_all,S.G_tau[block].data[:,i_orb,j_orb].real)[0])
-                elif type_DLR_gtau2giw == 'crude':
-                    α[block] = np.array(lstsq(κ_it_all,S.G_tau[block].data[:,i_orb,j_orb].real)[0])
-                    if i_orb == j_orb:
-                        tail_shift = ( np.sum(α[block]) + 1.0 ) / 2
-                        α[block][0] -= tail_shift
-                        α[block][-1] -= tail_shift
-                else:
-                    print('Error: unknown type of DLR_gtau2giw!')
+                α[block] = np.array(lstsq(κ_it_all,S.G_tau[block].data[:,i_orb,j_orb].real)[0])
+                if i_orb == j_orb:
+                    tail_shift = ( np.sum(α[block]) + 1.0 ) / 2
+                    α[block][0] -= tail_shift
+                    α[block][-1] -= tail_shift
 
                 S.G_tau[block].data[:,i_orb,j_orb] = (κ_it_all@α[block]).astype(complex)
                 S.G_iw[block].data[:,i_orb,j_orb] = (κ_mf_all@α[block]*beta).astype(complex)
 
     return
 
-def DLR_g02g0(G0_iw):
-
-    α = {}
-
-    for i, block in enumerate(block_lst,1):
-        for i_orb in range(n_orb):
-            for j_orb in range(n_orb):
-                if type_DLR_g02g0 == 'crude':
-                    α[block] = np.array(lstsq(κ_mf_all,G0_iw[block].data[:,i_orb,j_orb])[0])
-                    if i_orb == j_orb:
-                        tail_shift = ( np.sum(α[block]) + beta ) / 2
-                        α[block][0] -= tail_shift
-                        α[block][-1] -= tail_shift
-                else:
-                    print('Error: unknown type of DLR_g02g0!')
-
-                G0_iw[block].data[:,i_orb,j_orb] = (κ_mf_all@α[block]).astype(complex)
-
-    return
-
-def DLR_gloc2gloc(Gloc):
+def DLR_gloc2gloc(Gloc,tailfit,keepvalue):
+    
+    Gloc_ = Gloc.copy()
+    Gloc_ << 0.0+0.0j
 
     α = {}
 
@@ -291,25 +246,43 @@ def DLR_gloc2gloc(Gloc):
 
         for i_orb in range(n_orb):
             for j_orb in range(n_orb):
-
-                if type_DLR_gloc2gloc == 'constrained':
-                    if i_orb == j_orb:
-                        α[block] = lapack.zgglse(κ_mf, np.ones([1,len(rf)]), Gloc[block].data[index,i_orb,j_orb], np.array([[1]]))[3]
-                    else:
-                        α[block] = np.linalg.solve(κ_mf,Gloc[block].data[index,i_orb,j_orb])
-                elif type_DLR_gloc2gloc == 'crude':
-                    α[block] = np.linalg.solve(κ_mf,Gloc[block].data[index,i_orb,j_orb])
+                
+                α[block] = np.linalg.solve(κ_mf,Gloc[block].data[index,i_orb,j_orb])
+                
+                if keepvalue:
+                    tmp = deepcopy(Gloc[block].data[index,i_orb,j_orb])
+                    
+                if tailfit:
                     if i_orb == j_orb:
                         tail_shift = ( np.sum(α[block]) + beta ) / 2
                         α[block][0] -= tail_shift
                         α[block][-1] -= tail_shift
-                else:
-                    print('Error: unknown type of DLR_gloc2gloc!')
+                        
+                Gloc_[block].data[:,i_orb,j_orb] = (κ_mf_all@α[block]).astype(complex)
+                                
+                if keepvalue:
+                    Gloc_[block].data[index,i_orb,j_orb] = tmp
 
-                Gloc[block].data[:,i_orb,j_orb] = (κ_mf_all@α[block]).astype(complex)
-
+#                 if type_DLR_gloc2gloc == 'constrained':
+#                     if i_orb == j_orb:
+#                         α[block] = lapack.zgglse(κ_mf, np.ones([1,len(rf)]), Gloc[block].data[index,i_orb,j_orb], np.array([[1]]))[3]
+#                     else:
+#                         α[block] = np.linalg.solve(κ_mf,Gloc[block].data[index,i_orb,j_orb])
 #                 symmetrize(Gloc[block].data[:, i_orb, j_orb])
 
+    return Gloc_
+
+def DLR_Diw2Dtau(S,Delta_iw):
+    
+    α = {}
+    
+    for i, block in enumerate(block_lst,1):
+        for i_orb in range(n_orb):
+            for j_orb in range(n_orb):
+                α[block] = np.linalg.solve(κ_mf,Delta_iw[block].data[index,i_orb,j_orb])
+
+                S.Delta_tau[block].data[:,i_orb,j_orb] = ( κ_it_all@α[block] / beta ).real
+            
     return
 
 #check if there are previous runs in the outfile and if so restart from there
@@ -344,25 +317,13 @@ for iteration_number in range(1,nloops+1):
         print("Iteration = %s"%it)
         print('-----------------------------------------------')
 
-    # symmetrize Sigma
-    if it > 1:
-        S.Sigma_iw['up'] << .5*(S.Sigma_iw['up'] + S.Sigma_iw['down'])
-        S.Sigma_iw['down'] << S.Sigma_iw['up']
-
-        # all three orb are degenerate
-        S.Sigma_iw['up'] << 0.0+0.0j
-        for i_orb in range(n_orb):
-            S.Sigma_iw['up'][0,0] << S.Sigma_iw['up'][0,0] + (S.Sigma_iw['down'][i_orb,i_orb]/n_orb)
-
-        # write to all orbitals
-        for block, gf in S.Sigma_iw:
-            for i_orb in range(n_orb):
-                S.Sigma_iw[block][i_orb,i_orb] << S.Sigma_iw['up'][0,0]
-
     # determination of the next chemical potential via function Dens. Involves k summation
     start_time = timer()
     #mu, density = dichotomy(Dens, mu, density_required, 1e-4, .5, max_loops = 100, x_name="chemical potential", y_name="density", verbosity=3)
-    mu, density = dichotomy(dens_dlr, mu, density_required, 1e-4, .5, max_loops = 100, x_name="chemical potential", y_name="density", verbosity=3)
+    if it > 9 and l_fix_mu:
+        mu = fix_mu
+    else:
+        mu, density = dichotomy(dens_dlr, mu, density_required, 1e-4, .5, max_loops = 100, x_name="chemical potential", y_name="density", verbosity=3)
     mpi.barrier()
     mpi.report('\nnumber of kpoints:'+str(SK.n_kpts()))
     mpi.report('time for calculating mu: {:.2f} s'.format(timer() - start_time))
@@ -373,10 +334,10 @@ for iteration_number in range(1,nloops+1):
     # TODO step 3 write a new python function which replaces the SK() call which accepts a iw_vector and does the k sum only on these frequencies
     start_time = timer()
     # Gloc << SK(mu = mu, Sigma = S.Sigma_iw)
-    if l_DLR_gloc2gloc:
-        Gloc << sumk(mu = mu, Sigma= S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping, iw_index=index)
+    if grid == 'DLR':
+        Gloc << sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping, iw_index=index, tailfit=True, keepvalue=True)
     else:
-        Gloc << sumk(mu = mu, Sigma= S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping)
+        Gloc << sumk(mu = mu, Sigma = S.Sigma_iw, bz_weights=SK.bz_weights, hopping=SK.hopping)
     mpi.barrier()
     mpi.report('time for k sum: {:.2f} s'.format(timer() - start_time))
     # TODO step 1
@@ -387,15 +348,18 @@ for iteration_number in range(1,nloops+1):
     # evaluate DLR fit at all iw frequencies
     # see if the result is the same
 
-    nlat = Gloc.total_density().real # lattice density
+    Gloc_ = Gloc.copy()
+    if grid == 'DLR':
+        Gloc_ << DLR_gloc2gloc(Gloc,tailfit=True,keepvalue=False)
+    nlat = Gloc_.total_density().real # lattice density
     if mpi.is_master_node():
         print('Gloc density matrix:')
-        for block, gf in Gloc:
+        for block, gf in Gloc_:
             print(block)
             print(gf.density().real)
             print('--------------')
         print('total occupation {:.4f}'.format(nlat))
-
+    
     # calculate effective atomic levels (eal)
     solver_eal = e0 - np.diag([mu]*n_orb)
     Hloc_0 = Operator()
@@ -409,49 +373,30 @@ for iteration_number in range(1,nloops+1):
                     Hloc_0 += (solver_eal[o1,o2].real)/2 * (c_dag(spin,o1) * c(spin,o2) + c_dag(spin,o2) * c(spin,o1))
     p['h_loc0'] = Hloc_0
 
-
     # note with DLR it is good do replace this with the Delta(tau) interface
     G0_iw = Gloc.copy()
     G0_iw << 0.0+0.0j
 
     G0_iw << inverse(S.Sigma_iw + inverse(Gloc))
-
-    if l_symmetrize:
-        G0_iw['up'] << .5*(G0_iw['up'] + G0_iw['down'])
-        G0_iw['down'] << G0_iw['up']
-
-        # all three orb are degenerate
-        G0_iw['up'] << 0.0+0.0j
-        for i_orb in range(n_orb):
-            G0_iw['up'][0,0] << G0_iw['up'][0,0] + (G0_iw['down'][i_orb,i_orb]/n_orb)
-
-        # write to all orbitals
-        for block, gf in S.Sigma_iw:
-            for i_orb in range(n_orb):
-                G0_iw[block][i_orb,i_orb] << G0_iw['up'][0,0]
-
-        for i, block in enumerate(block_lst,1):
-            for i_orb in range(n_orb):
-                for j_orb in range(n_orb):
-                    symmetrize(G0_iw[block].data[:,i_orb,j_orb])
-
-    if l_DLR_g02g0:
-        DLR_g02g0(S)
-
+    
     Delta_iw = G0_iw.copy()
     Delta_iw << 0.0+0.0j
     for name, g0 in G0_iw:
         Delta_iw[name] << iOmega_n - inverse(g0) - solver_eal
-        known_moments = make_zero_tail(Delta_iw[name], 1)
-        tail, err = fit_hermitian_tail(Delta_iw[name], known_moments)
-        mpi.report('tail fit error Delta_iw for block {}: {}'.format(name,err))
-        S.Delta_tau[name] << make_gf_from_fourier(Delta_iw[name], S.Delta_tau.mesh, tail).real
-
+        if grid == 'DLR':
+            DLR_Diw2Dtau(S,Delta_iw)
+        else:
+            known_moments = make_zero_tail(Delta_iw[name], 1)
+            tail, err = fit_hermitian_tail(Delta_iw[name], known_moments)
+            mpi.report('tail fit error Delta_iw for block {}: {}'.format(name,err))
+            S.Delta_tau[name] << make_gf_from_fourier(Delta_iw[name], S.Delta_tau.mesh, tail).real
+    
     if mpi.is_master_node():
         ar = HDFArchive(outfile+'.h5','a')
         ar['iterations'] = it
         ar['G_0'] = G0_iw
         ar['G_0-%s'%it] = G0_iw
+        ar['Delta_tau'] = S.Delta_tau
         ar['Delta_tau-%s'%it] = S.Delta_tau
 #         ar['G_tau'] = S.G_tau
 #         ar['G_tau-%s'%it] = S.G_tau
@@ -462,24 +407,33 @@ for iteration_number in range(1,nloops+1):
         ar['Gloc'] = Gloc
         ar['Gloc-%s'%it] = Gloc
 #         ar['nimp-%s'%it] = nimp
-#         ar['nlat-%s'%it] = nlat
-#         ar['mu-%s'%it] = mu
+        ar['nlat-%s'%it] = nlat
+        ar['mu-%s'%it] = mu
         del ar
+    
+    if grid == 'DLR':
+        for name, D_tau in S.Delta_tau:
+            S.Delta_tau[name] << make_hermitian(D_tau)
 
     # solve the impurity problem. The solver is performing the dyson equation as postprocessing
     S.solve(h_int=h_int, **p)
 
-    if l_DLR_gtau2giw:
+    if tailfit == 'DLR':
         DLR_gtau2giw(S)
         S.Sigma_iw << inverse(G0_iw) - inverse(S.G_iw)
 
+    G_iw = S.G_iw.copy()
+    if grid == 'DLR':
+        G_iw << DLR_gloc2gloc(S.G_iw,tailfit=True,keepvalue=False)
+    nimp = G_iw.total_density().real #impurity density
     if mpi.is_master_node():
         print('impurity density matrix:')
-        for block, gf in S.G_iw:
+        for block, gf in G_iw:
             print(block)
             print(gf.density().real)
             print('--------------')
-        print('total occupation {:.4f}'.format(S.G_iw.total_density().real))
+        print('total occupation {:.4f}'.format(nimp))
+    mpi.report('Impurity density is {:.4f}'.format(nimp))
 
     # a manual dyson equation would look like this
     # S.Sigma_iw << inverse(G0_iw) - inverse(S.G_iw)
@@ -510,23 +464,28 @@ for iteration_number in range(1,nloops+1):
     if mpi.is_master_node():
         ar = HDFArchive(outfile+'.h5','a')
 #         ar['iterations'] = it
-#         ar['G_0'] = G0_iw
-#         ar['G_0-%s'%it] = G0_iw
-        ar['Delta_tau'] = S.Delta_tau
-        ar['Delta_tau-%s'%it] = S.Delta_tau
         ar['G_tau'] = S.G_tau
         ar['G_tau-%s'%it] = S.G_tau
         ar['G_iw'] = S.G_iw
         ar['G_iw-%s'%it] = S.G_iw
+#         if grid == 'DLR':
+#             ar['Sigma_iw'] = make_hermitian(inverse(G0_iw) - inverse(S.G_iw))
+#             ar['Sigma_iw-%s'%it] = ar['Sigma_iw'] 
+#             for name, g0 in G0_iw:
+#                 G0_iw[name] << make_hermitian(g0)
+#         else:
+#             ar['Sigma_iw'] = S.Sigma_iw
+#             ar['Sigma_iw-%s'%it] = S.Sigma_iw
+#         ar['G_0'] = G0_iw
+#         ar['G_0-%s'%it] = G0_iw
         ar['Sigma_iw'] = S.Sigma_iw
         ar['Sigma_iw-%s'%it] = S.Sigma_iw
-#         ar['Gloc'] = Gloc
-#         ar['Gloc-%s'%it] = Gloc
         ar['nimp-%s'%it] = nimp
-        ar['nlat-%s'%it] = nlat
-        ar['mu-%s'%it] = mu
+#         ar['nlat-%s'%it] = nlat
+#         ar['mu-%s'%it] = mu
+        if it > 1 or previous_present:
+            S.Sigma_iw << mix * S.Sigma_iw + (1.0-mix) * ar['Sigma_iw-%s'%(it-1)]
         del ar
-
-
-
-
+                
+    if it > 1 or previous_present:    
+        S.Sigma_iw << mpi.bcast(S.Sigma_iw)
